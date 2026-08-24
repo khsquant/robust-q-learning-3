@@ -225,7 +225,9 @@ def train(
       -(num_timesteps - num_prefill_env_steps)
       // (num_evals_after_init * env_steps_per_actor_step)
   )
-
+  WARM_FRAC = 0.3     # 각 환경 학습의 앞 30%에 걸쳐 β를 0→목표로 램프 (스케일-프리)
+  warm_updates = WARM_FRAC * (num_timesteps - num_prefill_env_steps) / env_steps_per_actor_step
+  
   assert num_envs % device_count == 0
   import copy
   env = copy.deepcopy(environment)
@@ -431,7 +433,7 @@ def train(
     return (new_training_state, key), metrics
   def adv_step(
       env, env_state, policy, normalizer_params, qr_params, dynamics_params, key, # q_params -> qr_params
-      extra_fields=(),
+      beta_scale=1.0, extra_fields=(),
     ):
       act_key, key = jax.random.split(key)
       actions, policy_extras = policy(env_state.obs, act_key)
@@ -449,7 +451,10 @@ def train(
       #      normalizer_params, q_params, env_state.obs, actions).mean(-1)
       q_values = sac_network.qr_network.apply(
           normalizer_params, qr_params, env_state.obs, actions, dynamics_params).mean(-1)
-      target_lnpdf = beta * q_values / 100
+      # (기존) target_lnpdf = beta * q_values / 100
+      q_sg = jax.lax.stop_gradient(q_values)
+      logw = (beta * beta_scale) * (q_sg - q_sg.mean()) / 100.0          # 배치 평균 차감 → 절대 Q 드리프트(음수 발산) 면역
+      target_lnpdf = jnp.clip(logw, -3.0, 3.0)            # 집중 상한: 최대 가중비 e^6≈400배
       return nstate, TransitionwithParams(
           observation=env_state.obs,
           action=actions,
@@ -465,12 +470,12 @@ def train(
 
   def get_experience(
       normalizer_params, policy_params, qr_params, dynamics_params, # q_params -> qr_params
-      env_state, buffer_state, key,
+      env_state, buffer_state, key, beta_scale=1.0,
   ):
     policy = make_policy((normalizer_params, policy_params))
     env_state, transitions = adv_step(
         env, env_state, policy, normalizer_params, qr_params, dynamics_params, key,  # q_params -> qr_params
-        extra_fields=('truncation',))
+        beta_scale=beta_scale, extra_fields=('truncation',))
     normalizer_params = running_statistics.update(
         normalizer_params, transitions.observation, pmap_axis_name=_PMAP_AXIS_NAME)
     simul_info = {
@@ -488,9 +493,12 @@ def train(
     experience_key, training_key, param_key, key_gmm = jax.random.split(key, 4)
     sampled_params, mapping = sac_network.gmm_network.sample_selector.select_samples(
         training_state.gmm_training_state.model_state, param_key)
+
+    nu = training_state.gmm_training_state.num_updates
+    beta_scale = jnp.clip(nu / warm_updates, 0.0, 1.0)     # 0→1 램프 후 1 유지
     normalizer_params, env_state, buffer_state, simul_info, simul_transitions = get_experience(
         training_state.normalizer_params, training_state.policy_params,
-        training_state.qr_params, sampled_params, env_state, buffer_state, experience_key) # 수정됨
+        training_state.qr_params, sampled_params, env_state, buffer_state, experience_key, beta_scale=beta_scale) # 수정됨
     new_sample_db_state = sac_network.gmm_network.sample_selector.save_samples(
         training_state.gmm_training_state.model_state,
         training_state.gmm_training_state.sample_db_state,
