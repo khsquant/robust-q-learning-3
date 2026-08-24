@@ -270,6 +270,9 @@ def train(
       -(num_timesteps - num_prefill_env_steps)
       // (num_evals_after_init * env_steps_per_actor_step)
   )
+  WARM_FRAC = 0.3     # 각 환경 학습의 앞 30%에 걸쳐 β를 0→목표로 램프 (스케일-프리)
+  warm_updates = WARM_FRAC * (num_timesteps - num_prefill_env_steps) / env_steps_per_actor_step
+  
   print("num training steps per epoch", num_training_steps_per_epoch)
   assert num_envs % device_count == 0
   import copy
@@ -483,6 +486,7 @@ def train(
     dynamics_params,
     noise_scales : jnp.ndarray,
     key: PRNGKey,
+    beta_scale=1.0,
     extra_fields: Sequence[str] = (),
   ):
     action_key, tc_key = jax.random.split(key)
@@ -512,7 +516,10 @@ def train(
       q_values = gmmtd3_network.q_network.apply(
           normalizer_params, q_params, env_state.obs, actions
       ).mean(-1)
-    target_lnpdf = beta * q_values/100
+    # target_lnpdf = beta * q_values/100
+    q_sg = jax.lax.stop_gradient(q_values)
+    logw = (beta * beta_scale) * (q_sg - q_sg.mean()) / 100.0          # 배치 평균 차감 → 절대 Q 드리프트(음수 발산) 면역
+    target_lnpdf = jnp.clip(logw, -3.0, 3.0)            # 집중 상한: 최대 가중비 e^6≈400배
     return nstate, TransitionwithGMMParams(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=env_state.obs,
         action=actions,
@@ -536,6 +543,7 @@ def train(
       env_state: envs.State,
       buffer_state: ReplayBufferState,
       key: PRNGKey,
+      beta_scale=1.0,
   ) -> Tuple[
       running_statistics.RunningStatisticsState,
       envs.State,
@@ -553,6 +561,7 @@ def train(
         dynamics_params,
         noise_scales,
         key,
+        beta_scale=beta_scale,
         extra_fields=('truncation',),
     )
 
@@ -609,6 +618,9 @@ def train(
         training_state.gmm_training_state.model_state,
         param_key,
     )
+
+    nu = training_state.gmm_training_state.num_updates
+    beta_scale = jnp.clip(nu / warm_updates, 0.0, 1.0)     # 0→1 램프 후 1 유지
     normalizer_params, noise_scales, env_state, buffer_state, simul_info, simul_transitions = get_experience(
         training_state.normalizer_params,
         training_state.policy_params,
