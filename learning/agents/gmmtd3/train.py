@@ -692,6 +692,7 @@ def train(
           env_state,
           buffer_state,
           key,
+          beta_scale=0.0,
       )
       new_sample_db_state = gmmtd3_network.gmm_network.sample_selector.save_samples(training_state.gmm_training_state.model_state, \
                       training_state.gmm_training_state.sample_db_state, sampled_dynamics_params, simul_transitions.target_lnpdf, \
