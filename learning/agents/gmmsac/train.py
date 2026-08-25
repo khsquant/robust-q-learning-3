@@ -532,7 +532,7 @@ def train(
           training_state.gmm_training_state.model_state, param_key)
       new_normalizer_params, env_state, buffer_state, _, simul_transitions = get_experience(
           training_state.normalizer_params, training_state.policy_params,
-          training_state.qr_params, sampled_params, env_state, buffer_state, key) # 수정됨
+          training_state.qr_params, sampled_params, env_state, buffer_state, key, beta_scale=0.0) # 수정됨
       new_sample_db_state = sac_network.gmm_network.sample_selector.save_samples(
           training_state.gmm_training_state.model_state,
           training_state.gmm_training_state.sample_db_state,
